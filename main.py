@@ -823,5 +823,89 @@ async def cancel(
 
     text = f"✅ Стрела #{raid_id} отменена."
 
-    view = raid["view"]
-    message = raid
+        message = raid["message"]
+
+    if view is not None:
+        async with view.lock:
+            for child in view.children:
+                child.disabled = True
+
+            if message is not None:
+                try:
+                    await message.edit(
+                        content="🚫 Стрела отменена.",
+                        embed=build_embed(raid),
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
+
+                except discord.HTTPException:
+                    log.exception(
+                        "Не удалось обновить отменённую стрелу #%s",
+                        raid_id
+                    )
+
+                    text += (
+                        "\n⚠️ Не удалось обновить "
+                        "сообщение в канале."
+                    )
+
+        view.stop()
+
+    await interaction.followup.send(
+        text,
+        ephemeral=True
+    )
+
+
+# ================= ОШИБКИ КОМАНД =================
+
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    original = getattr(error, "original", error)
+
+    log.error(
+        "Ошибка слэш-команды",
+        exc_info=(
+            type(original),
+            original,
+            original.__traceback__
+        )
+    )
+
+    text = (
+        "❌ Произошла ошибка при выполнении команды. "
+        "Подробности записаны в логах бота."
+    )
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                text,
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                text,
+                ephemeral=True
+            )
+
+    except discord.HTTPException:
+        log.exception(
+            "Не удалось отправить сообщение об ошибке."
+        )
+
+
+# ================= ЗАПУСК =================
+
+@bot.event
+async def on_ready():
+    log.info(
+        "Бот подключён: %s | Время Москвы: %s",
+        bot.user,
+        now().strftime("%d.%m.%Y %H:%M:%S")
+    )
+
+
+if __name__ == "__main__":
+    bot.run(TOKEN)

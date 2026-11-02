@@ -20,10 +20,14 @@ if not TOKEN:
         "❌ Не найдена переменная окружения DISCORD_TOKEN."
     )
 
-CHANNEL_ID = 1564244322109628537
+CHANNEL_ID = 1543007392315474080
 
 ADMIN_IDS = [
     1416863224430596107,
+    1076786393658970214,
+    1519017264295313548,
+    541552528677011457,
+    1326336317071818804,
 ]
 
 NOTIFICATION_BEFORE_MINUTES = 30
@@ -769,4 +773,305 @@ async def slot(
 
     await interaction.response.send_message(
         f"✅ **Стрела #{schedule_id} запланирована.**\n\n"
-        f"🏛️ **DISLOCATION MAF
+                f"🏛️ **DISLOCATION MAFIA**\n"
+        f"🌍 Сервер: **{server.value}**\n"
+        f"🔫 Против: **{faction.value}**\n"
+        f"🧰 Оружие: **{', '.join(weapons)}**\n"
+        f"🎯 Формат: **{format.value}**\n"
+        f"⏰ Начало: **{start_time:%d.%m.%Y %H:%M} МСК**\n"
+        f"📣 Уведомление и открытие слотов: "
+        f"**{publish_time:%d.%m.%Y %H:%M} МСК**\n"
+        f"📋 Итоговый пик слотов: "
+        f"**{final_time:%d.%m.%Y %H:%M} МСК**",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="fslot",
+    description="⚡ Запустить пик слотов прямо сейчас"
+)
+@app_commands.describe(
+    server="🌍 Выбери сервер",
+    faction="🔫 Выбери фракцию противника",
+    deagle="🧨 Разрешён ли Deagle?",
+    shotgun="🔫 Разрешён ли Shotgun?",
+    rifla="🎯 Разрешена ли Rifla?",
+    format="🎯 Выбери формат",
+    time_str="⏰ Выбери время начала стрелы по МСК"
+)
+@app_commands.choices(
+    server=SERVER_CHOICES,
+    faction=FACTION_CHOICES,
+    deagle=YES_NO_CHOICES,
+    shotgun=YES_NO_CHOICES,
+    rifla=YES_NO_CHOICES,
+    format=FORMAT_CHOICES,
+    time_str=TIME_CHOICES
+)
+async def fslot(
+    interaction: Interaction,
+    server: app_commands.Choice[str],
+    faction: app_commands.Choice[str],
+    deagle: app_commands.Choice[str],
+    shotgun: app_commands.Choice[str],
+    rifla: app_commands.Choice[str],
+    format: app_commands.Choice[str],
+    time_str: app_commands.Choice[str]
+):
+    global next_schedule_id
+    global last_raid_message_id
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "📩 Используй команду `/fslot` на сервере.",
+            ephemeral=True
+        )
+        return
+
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "🚫 У тебя нет прав для запуска стрел.",
+            ephemeral=True
+        )
+        return
+
+    weapons = []
+
+    if deagle.value == "yes":
+        weapons.append("Deagle")
+
+    if shotgun.value == "yes":
+        weapons.append("Shotgun")
+
+    if rifla.value == "yes":
+        weapons.append("Rifla")
+
+    if not weapons:
+        await interaction.response.send_message(
+            "❌ Ошибка: нужно выбрать хотя бы одно оружие.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        slots_total = parse_format(format.value)
+        start_time = get_start_datetime(time_str.value)
+
+    except ValueError as error:
+        await interaction.response.send_message(
+            f"❌ Ошибка: {error}",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    channel = await get_target_channel()
+
+    if not channel:
+        await interaction.followup.send(
+            "❌ Не найден канал для публикации стрелы. "
+            "Проверь `CHANNEL_ID` и права бота.",
+            ephemeral=True
+        )
+        return
+
+    schedule_id = next_schedule_id
+    next_schedule_id += 1
+
+    data = {
+        "server": server.value,
+        "faction": faction.value,
+        "weapon": ", ".join(weapons),
+        "format": format.value,
+        "slots_total": slots_total,
+        "time": time_str.value,
+        "creator_id": interaction.user.id,
+        "main": [],
+        "reserve": []
+    }
+
+    try:
+        await send_raid_gif(channel)
+
+        await channel.send(
+            "@everyone ⚡ **Пик слотов запущен прямо сейчас!**\n\n"
+            f"🏛️ **DISLOCATION MAFIA**\n"
+            f"🌍 Сервер: **{data['server']}**\n"
+            f"🔫 Против: **{data['faction']}**\n"
+            f"🧰 Оружие: **{data['weapon']}**\n"
+            f"🎯 Формат: **{data['format']}**\n"
+            f"⏰ Время начала: **{data['time']} МСК**\n\n"
+            "🟢 Занимай слот ниже.",
+            allowed_mentions=discord.AllowedMentions(
+                everyone=True,
+                users=False,
+                roles=False
+            )
+        )
+
+        view = RaidView(data)
+
+        message = await channel.send(
+            embed=build_embed(data),
+            view=view
+        )
+
+        view.message = message
+
+        active_raids[message.id] = {
+            "data": data,
+            "view": view,
+            "message": message
+        }
+
+        last_raid_message_id = message.id
+
+        await interaction.followup.send(
+            f"✅ **Стрела #{schedule_id} запущена прямо сейчас.**\n\n"
+            f"🌍 Сервер: **{data['server']}**\n"
+            f"🔫 Против: **{data['faction']}**\n"
+            f"🧰 Оружие: **{data['weapon']}**\n"
+            f"🎯 Формат: **{data['format']}**\n"
+            f"⏰ Начало: **{start_time:%d.%m.%Y %H:%M} МСК**",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ У бота нет прав отправлять сообщения в канал стрел.",
+            ephemeral=True
+        )
+
+    except discord.HTTPException as error:
+        await interaction.followup.send(
+            f"❌ Ошибка Discord при запуске стрелы: `{error}`",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(
+    name="strels",
+    description="📋 Показать все запланированные стрелы"
+)
+async def strels(interaction: Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "🚫 Команду `/strels` нельзя использовать в личных сообщениях.",
+            ephemeral=True
+        )
+        return
+
+    if not scheduled_raids:
+        await interaction.response.send_message(
+            "📭 Сейчас нет запланированных стрел.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="📋 Запланированные стрелы",
+        description="🩸 **DISLOCATION MAFIA**",
+        color=discord.Color.dark_red()
+    )
+
+    for number, raid in scheduled_raids.items():
+        data = raid["data"]
+
+        embed.add_field(
+            name=f"🏹 Стрела #{number} | {data['server']}",
+            value=(
+                f"🔫 Против: **{data['faction']}**\n"
+                f"🧰 Оружие: **{data['weapon']}**\n"
+                f"🎯 Формат: **{data['format']}**\n"
+                f"⏰ Начало: **{raid['start_time']:%d.%m.%Y %H:%M} МСК**\n"
+                f"👑 Создал: <@{data['creator_id']}>"
+            ),
+            inline=False
+        )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="cancel",
+    description="❌ Отменить запланированную стрелу"
+)
+@app_commands.describe(
+    raid_id="Номер стрелы, которую нужно отменить"
+)
+async def cancel(
+    interaction: Interaction,
+    raid_id: int
+):
+    if interaction.guild is not None:
+        await interaction.response.send_message(
+            "📩 Используй команду `/cancel` в личных сообщениях с ботом.",
+            ephemeral=True
+        )
+        return
+
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "🚫 У тебя нет прав для отмены стрел.",
+            ephemeral=True
+        )
+        return
+
+    raid = scheduled_raids.get(raid_id)
+
+    if not raid:
+        await interaction.response.send_message(
+            f"❌ Стрела #{raid_id} не найдена.",
+            ephemeral=True
+        )
+        return
+
+    task = raid.get("task")
+
+    if task and not task.done():
+        task.cancel()
+
+    scheduled_raids.pop(raid_id, None)
+
+    await interaction.response.send_message(
+        f"✅ Стрела #{raid_id} отменена.",
+        ephemeral=True
+    )
+
+
+@bot.event
+async def setup_hook():
+    await bot.tree.sync()
+    print("✅ Слэш-команды синхронизированы.")
+
+
+@bot.event
+async def on_ready():
+    print(f"✅ Бот запущен как {bot.user} (ID: {bot.user.id})")
+    print(
+        f"🕒 Текущее московское время: "
+        f"{datetime.now(MSK):%d.%m.%Y %H:%M:%S}"
+    )
+
+    bot.loop.create_task(random_chat_loop())
+
+
+try:
+    bot.run(TOKEN, log_handler=None)
+
+except discord.LoginFailure:
+    raise RuntimeError(
+        "❌ Неверный Discord-токен. Сбрось токен в Developer Portal "
+        "и обнови переменную окружения DISCORD_TOKEN."
+    )
+
+except discord.PrivilegedIntentsRequired:
+    raise RuntimeError(
+        "❌ Включи Message Content Intent в Discord Developer Portal "
+        "-> Bot -> Privileged Gateway Intents."
+)

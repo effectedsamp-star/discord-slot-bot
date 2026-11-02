@@ -1,13 +1,11 @@
 import os
 import asyncio
-import random
-import re
-from collections import Counter
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
-from discord import ui, Interaction, app_commands
+from discord import ui, app_commands
 from discord.ext import commands
 
 
@@ -15,980 +13,768 @@ from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-if not TOKEN:
-    raise RuntimeError(
-        "❌ Не найдена переменная окружения DISCORD_TOKEN."
-    )
+CHANNEL_ID = 1564244322109628537
 
-CHANNEL_ID = 1543007392315474080
-
-ADMIN_IDS = [
+ADMIN_IDS = {
     1416863224430596107,
-    1076786393658970214,
-    1519017264295313548,
-    541552528677011457,
-    1326336317071818804,
-]
-
-NOTIFICATION_BEFORE_MINUTES = 30
-FINAL_NOTIFICATION_BEFORE_MINUTES = 15
-
-MIN_CHAT_DELAY_SECONDS = 30 * 60
-MAX_CHAT_DELAY_SECONDS = 60 * 60
+}
 
 RAID_GIF_URL = "https://i.ibb.co/C5RHPHP4/10312.gif"
 
-MSK = ZoneInfo("Europe/Moscow")
+TIMEZONE = ZoneInfo("Europe/Moscow")
 
-# ===============================================
+FIRST_NOTIFICATION_MINUTES = 30
+FINAL_NOTIFICATION_MINUTES = 15
 
+RESERVE_LIMIT = 3
 
-intents = discord.Intents.default()
-intents.message_content = True
-
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 
-active_raids = {}
-scheduled_raids = {}
+log = logging.getLogger("dislocation")
 
-last_raid_message_id = None
-next_schedule_id = 1
+if not TOKEN:
+    raise RuntimeError(
+        "Не найдена переменная окружения DISCORD_TOKEN."
+    )
 
-word_counts = Counter()
-phrase_counts = Counter()
+TOKEN = TOKEN.strip()
 
 
-# ================= ВЫБОРЫ В /slot =================
+# ================= БОТ =================
 
+class DislocationBot(commands.Bot):
+    async def setup_hook(self):
+        synced = await self.tree.sync()
+
+        log.info(
+            "Слэш-команды синхронизированы: %s",
+            len(synced)
+        )
+
+
+bot = DislocationBot(
+    command_prefix="!",
+    intents=discord.Intents.default()
+)
+
+raids = {}
+raid_tasks = {}
+
+next_raid_id = 1
+
+
+# ================= ВАРИАНТЫ В КОМАНДАХ =================
 
 SERVER_CHOICES = [
-    app_commands.Choice(name="13 Kingman", value="13 Kingman"),
-    app_commands.Choice(name="16 Gilbert", value="16 Gilbert"),
-]
-
-FACTION_CHOICES = [
-    app_commands.Choice(name="Dislocation Mafia", value="Dislocation Mafia"),
-    app_commands.Choice(name="RM", value="RM"),
-    app_commands.Choice(name="LCN", value="LCN"),
-    app_commands.Choice(name="TRB", value="TRB"),
-    app_commands.Choice(name="YKZ", value="YKZ"),
-    app_commands.Choice(name="WMC", value="WMC"),
-]
-
-YES_NO_CHOICES = [
-    app_commands.Choice(name="✅ Да", value="yes"),
-    app_commands.Choice(name="❌ Нет", value="no"),
+    app_commands.Choice(
+        name="[13] Kingman",
+        value="[13] Kingman"
+    ),
+    app_commands.Choice(
+        name="[16] Gilbert",
+        value="[16] Gilbert"
+    ),
 ]
 
 FORMAT_CHOICES = [
-    app_commands.Choice(name="2x2", value="2x2"),
-    app_commands.Choice(name="3x3", value="3x3"),
-    app_commands.Choice(name="4x4", value="4x4"),
-    app_commands.Choice(name="5x5", value="5x5"),
+    app_commands.Choice(name="2x2", value=2),
+    app_commands.Choice(name="3x3", value=3),
+    app_commands.Choice(name="4x4", value=4),
+    app_commands.Choice(name="5x5", value=5),
 ]
 
 TIME_CHOICES = [
-    app_commands.Choice(name="16:00 МСК", value="16:00"),
-    app_commands.Choice(name="16:20 МСК", value="16:20"),
-    app_commands.Choice(name="16:40 МСК", value="16:40"),
-    app_commands.Choice(name="17:00 МСК", value="17:00"),
-    app_commands.Choice(name="17:20 МСК", value="17:20"),
-    app_commands.Choice(name="17:40 МСК", value="17:40"),
-    app_commands.Choice(name="18:00 МСК", value="18:00"),
-    app_commands.Choice(name="18:20 МСК", value="18:20"),
-    app_commands.Choice(name="18:40 МСК", value="18:40"),
-    app_commands.Choice(name="19:00 МСК", value="19:00"),
-    app_commands.Choice(name="19:20 МСК", value="19:20"),
-    app_commands.Choice(name="19:40 МСК", value="19:40"),
-    app_commands.Choice(name="20:00 МСК", value="20:00"),
-    app_commands.Choice(name="20:20 МСК", value="20:20"),
-    app_commands.Choice(name="20:40 МСК", value="20:40"),
-    app_commands.Choice(name="21:00 МСК", value="21:00"),
-    app_commands.Choice(name="21:20 МСК", value="21:20"),
-    app_commands.Choice(name="21:40 МСК", value="21:40"),
+    app_commands.Choice(
+        name=f"{hour:02d}:{minute:02d}",
+        value=f"{hour:02d}:{minute:02d}"
+    )
+    for hour in range(16, 22)
+    for minute in (0, 20, 40)
 ]
 
 
-# ===================================================
+# ================= ВРЕМЯ =================
+
+def now():
+    return datetime.now(TIMEZONE)
 
 
-def is_admin(user: discord.abc.User) -> bool:
-    return user.id in ADMIN_IDS
+def get_start_time(time_text):
+    hours, minutes = map(int, time_text.split(":"))
 
+    current = now()
 
-def parse_format(format_text: str) -> int:
-    formats = {
-        "2x2": 2,
-        "3x3": 3,
-        "4x4": 4,
-        "5x5": 5,
-    }
-
-    cleaned = format_text.lower().replace(" ", "").replace("х", "x")
-
-    if cleaned not in formats:
-        raise ValueError(
-            "❌ Формат должен быть: 2x2, 3x3, 4x4 или 5x5."
-        )
-
-    return formats[cleaned]
-
-
-def get_start_datetime(time_text: str) -> datetime:
-    hours_text, minutes_text = time_text.split(":")
-
-    hours = int(hours_text)
-    minutes = int(minutes_text)
-
-    now = datetime.now(MSK)
-
-    start_time = now.replace(
+    start = current.replace(
         hour=hours,
         minute=minutes,
         second=0,
         microsecond=0
     )
 
-    if start_time <= now:
-        start_time += timedelta(days=1)
+    if start <= current:
+        start += timedelta(days=1)
 
-    return start_time
-
-
-def clean_chat_text(text: str) -> str:
-    text = text.lower().strip()
-
-    text = re.sub(
-        r"https?://\S+|www\.\S+",
-        "",
-        text
-    )
-
-    text = re.sub(
-        r"<@!?\d+>|<@&\d+>|<#\d+>",
-        "",
-        text
-    )
-
-    return re.sub(r"\s+", " ", text).strip()
+    return start
 
 
-def build_embed(data: dict) -> discord.Embed:
-    main_list = "\n".join(
-        f"{number}. <@{user_id}>"
-        for number, user_id in enumerate(data["main"], start=1)
-    ) or "—"
+async def wait_until(target):
+    while True:
+        seconds = (target - now()).total_seconds()
 
-    reserve_list = "\n".join(
-        f"{number}. <@{user_id}>"
-        for number, user_id in enumerate(data["reserve"], start=1)
-    ) or "—"
+        if seconds <= 0:
+            return
 
-    embed = discord.Embed(
-        title=f"🏹 Стрела | {data['server']}",
-        description=(
-            "🩸 **DISLOCATION MAFIA**\n"
-            "⚔️ Готовься к бою и занимай слот."
-        ),
-        color=discord.Color.dark_red()
-    )
-
-    embed.add_field(
-        name="🎯 Формат",
-        value=data["format"],
-        inline=True
-    )
-
-    embed.add_field(
-        name="⏰ Время начала",
-        value=f"{data['time']} МСК",
-        inline=True
-    )
-
-    embed.add_field(
-        name="🔫 Против",
-        value=data["faction"],
-        inline=True
-    )
-
-    embed.add_field(
-        name="🧰 Оружие",
-        value=data["weapon"],
-        inline=True
-    )
-
-    embed.add_field(
-        name="👑 Создал",
-        value=f"<@{data['creator_id']}>",
-        inline=True
-    )
-
-    embed.add_field(
-        name=f"🟢 Основные слоты ({len(data['main'])}/{data['slots_total']})",
-        value=main_list,
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"🟡 Резерв ({len(data['reserve'])}/3)",
-        value=reserve_list,
-        inline=False
-    )
-
-    embed.set_image(url=RAID_GIF_URL)
-
-    embed.set_footer(
-        text="🩸 DISLOCATION MAFIA • Нажми кнопку, чтобы записаться или покинуть слот."
-    )
-
-    return embed
+        await asyncio.sleep(min(seconds, 60))
 
 
-class RaidView(ui.View):
-    def __init__(self, data: dict):
-        super().__init__(timeout=None)
-
-        self.data = data
-        self.message = None
-        self.lock = asyncio.Lock()
-
-    async def update_message(self):
-        if self.message is not None:
-            await self.message.edit(
-                embed=build_embed(self.data),
-                view=self
-            )
-
-    @ui.button(
-        label="Взять основной слот",
-        style=discord.ButtonStyle.green,
-        emoji="🟢",
-        custom_id="main_slot"
-    )
-    async def main_button(
-        self,
-        interaction: Interaction,
-        button: ui.Button
-    ):
-        user_id = interaction.user.id
-
-        async with self.lock:
-            if user_id in self.data["main"]:
-                await interaction.response.send_message(
-                    "⚠️ Ты уже записан в основные слоты.",
-                    ephemeral=True
-                )
-                return
-
-            if len(self.data["main"]) >= self.data["slots_total"]:
-                await interaction.response.send_message(
-                    "🟡 Основные слоты заполнены. Можешь записаться в резерв.",
-                    ephemeral=True
-                )
-                return
-
-            was_in_reserve = user_id in self.data["reserve"]
-
-            if was_in_reserve:
-                self.data["reserve"].remove(user_id)
-
-            self.data["main"].append(user_id)
-
-            slot_number = len(self.data["main"])
-
-            await interaction.response.defer(ephemeral=True)
-            await self.update_message()
-
-            if was_in_reserve:
-                text = (
-                    "✅ Ты переведён из резерва в основу.\n"
-                    f"🎯 Твой номер основного слота: **{slot_number}**.\n"
-                    "🚪 Покинуть слот можно кнопкой **«Покинуть слот»**."
-                )
-            else:
-                text = (
-                    f"✅ Ты успешно взял основной слот №**{slot_number}**.\n"
-                    "🚪 Покинуть слот можно кнопкой **«Покинуть слот»**."
-                )
-
-            await interaction.followup.send(
-                text,
-                ephemeral=True
-            )
-
-    @ui.button(
-        label="Взять резерв",
-        style=discord.ButtonStyle.secondary,
-        emoji="🟡",
-        custom_id="reserve_slot"
-    )
-    async def reserve_button(
-        self,
-        interaction: Interaction,
-        button: ui.Button
-    ):
-        user_id = interaction.user.id
-
-        async with self.lock:
-            if user_id in self.data["reserve"]:
-                await interaction.response.send_message(
-                    "⚠️ Ты уже записан в резерв.",
-                    ephemeral=True
-                )
-                return
-
-            if user_id in self.data["main"]:
-                await interaction.response.send_message(
-                    "⚠️ Ты уже записан в основные слоты.",
-                    ephemeral=True
-                )
-                return
-
-            if len(self.data["reserve"]) >= 3:
-                await interaction.response.send_message(
-                    "🚫 Резерв заполнен. Максимум: 3 игрока.",
-                    ephemeral=True
-                )
-                return
-
-            self.data["reserve"].append(user_id)
-
-            reserve_number = len(self.data["reserve"])
-
-            await interaction.response.defer(ephemeral=True)
-            await self.update_message()
-
-            await interaction.followup.send(
-                f"✅ Ты успешно взял резервный слот №**{reserve_number}**.\n"
-                "🚪 Покинуть слот можно кнопкой **«Покинуть слот»**.",
-                ephemeral=True
-            )
-
-    @ui.button(
-        label="Покинуть слот",
-        style=discord.ButtonStyle.danger,
-        emoji="🚪",
-        custom_id="leave_slot"
-    )
-    async def leave_button(
-        self,
-        interaction: Interaction,
-        button: ui.Button
-    ):
-        user_id = interaction.user.id
-
-        async with self.lock:
-            if user_id in self.data["main"]:
-                self.data["main"].remove(user_id)
-                place = "основные слоты"
-
-            elif user_id in self.data["reserve"]:
-                self.data["reserve"].remove(user_id)
-                place = "резерв"
-
-            else:
-                await interaction.response.send_message(
-                    "⚠️ Ты не записан в эту стрелу.",
-                    ephemeral=True
-                )
-                return
-
-            await interaction.response.defer(ephemeral=True)
-            await self.update_message()
-
-            await interaction.followup.send(
-                f"✅ Ты успешно покинул {place}.",
-                ephemeral=True
-            )
-
+# ================= КАНАЛ =================
 
 async def get_target_channel():
     channel = bot.get_channel(CHANNEL_ID)
 
     if channel is None:
-        try:
-            channel = await bot.fetch_channel(CHANNEL_ID)
-        except discord.DiscordException:
-            return None
+        channel = await bot.fetch_channel(CHANNEL_ID)
 
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return None
+    if not isinstance(
+        channel,
+        (discord.TextChannel, discord.Thread)
+    ):
+        raise RuntimeError(
+            "CHANNEL_ID должен указывать "
+            "на текстовый канал или ветку."
+        )
 
     return channel
 
 
-async def send_raid_gif(channel: discord.abc.Messageable):
+# ================= ОФОРМЛЕНИЕ =================
+
+def raid_details(raid):
+    return (
+        f"🌍 Сервер: {raid['server']}\n"
+        f"⏰ Время: {raid['start']:%d.%m %H:%M}\n"
+        f"🎯 Формат: {raid['slots']}x{raid['slots']}"
+    )
+
+
+def build_embed(raid):
+    main_text = "\n".join(
+        f"{index}. <@{user_id}>"
+        for index, user_id in enumerate(
+            raid["main"],
+            start=1
+        )
+    ) or "Пока свободно"
+
+    reserve_text = "\n".join(
+        f"{index}. <@{user_id}>"
+        for index, user_id in enumerate(
+            raid["reserve"],
+            start=1
+        )
+    ) or "Пока свободно"
+
+    if raid["cancelled"]:
+        description = "🚫 Стрела отменена."
+        color = discord.Color.dark_grey()
+
+    elif now() >= raid["start"]:
+        description = "🏹 Стрела началась. Запись закрыта."
+        color = discord.Color.dark_grey()
+
+    else:
+        description = (
+            "🏹 Сбор состава на стрелу.\n"
+            "Занимай свой слот и готовься к выходу."
+        )
+        color = discord.Color.dark_red()
+
+    embed = discord.Embed(
+        title="🩸 DISLOCATION MAFIA",
+        description=description,
+        color=color
+    )
+
+    embed.add_field(
+        name="🌍 Сервер",
+        value=raid["server"],
+        inline=True
+    )
+
+    embed.add_field(
+        name="⏰ Время",
+        value=raid["start"].strftime("%d.%m %H:%M"),
+        inline=True
+    )
+
+    embed.add_field(
+        name="🎯 Формат",
+        value=f"{raid['slots']}x{raid['slots']}",
+        inline=True
+    )
+
+    embed.add_field(
+        name=(
+            f"🟢 Основа "
+            f"({len(raid['main'])}/{raid['slots']})"
+        ),
+        value=main_text,
+        inline=False
+    )
+
+    embed.add_field(
+        name=(
+            f"🟡 Резерв "
+            f"({len(raid['reserve'])}/{RESERVE_LIMIT})"
+        ),
+        value=reserve_text,
+        inline=False
+    )
+
+    embed.set_footer(
+        text=f"DISLOCATION MAFIA • Стрела #{raid['id']}"
+    )
+
+    return embed
+
+
+# ================= КНОПКИ =================
+
+class RaidView(ui.View):
+    def __init__(self, raid):
+        super().__init__(timeout=None)
+
+        self.raid = raid
+        self.lock = asyncio.Lock()
+
+        for child in self.children:
+            child.custom_id = (
+                f"dislocation:{raid['id']}:{child.custom_id}"
+            )
+
+    async def change_slot(self, interaction, action):
+        await interaction.response.defer(ephemeral=True)
+
+        async with self.lock:
+            raid = self.raid
+            user_id = interaction.user.id
+            changed = False
+
+            if raid["cancelled"]:
+                text = "🚫 Эта стрела отменена."
+
+            elif now() >= raid["start"]:
+                text = "⏰ Стрела уже началась. Запись закрыта."
+
+            elif action == "main":
+                if user_id in raid["main"]:
+                    text = "⚠️ Ты уже записан в основу."
+
+                elif len(raid["main"]) >= raid["slots"]:
+                    text = (
+                        "🟡 Основные слоты заполнены. "
+                        "Можешь записаться в резерв."
+                    )
+
+                else:
+                    was_in_reserve = user_id in raid["reserve"]
+
+                    if was_in_reserve:
+                        raid["reserve"].remove(user_id)
+
+                    raid["main"].append(user_id)
+                    changed = True
+
+                    slot_number = len(raid["main"])
+
+                    if was_in_reserve:
+                        text = (
+                            "✅ Ты переведён из резерва в основу.\n"
+                            f"🎯 Твой слот: №{slot_number}."
+                        )
+                    else:
+                        text = (
+                            "✅ Ты записан в основу.\n"
+                            f"🎯 Твой слот: №{slot_number}."
+                        )
+
+            elif action == "reserve":
+                if user_id in raid["main"]:
+                    text = "⚠️ Ты уже записан в основу."
+
+                elif user_id in raid["reserve"]:
+                    text = "⚠️ Ты уже записан в резерв."
+
+                elif len(raid["reserve"]) >= RESERVE_LIMIT:
+                    text = "🚫 Резерв заполнен."
+
+                else:
+                    raid["reserve"].append(user_id)
+                    changed = True
+
+                    text = (
+                        "✅ Ты записан в резерв.\n"
+                        f"🟡 Твой номер: №{len(raid['reserve'])}."
+                    )
+
+            else:
+                if user_id in raid["main"]:
+                    raid["main"].remove(user_id)
+                    changed = True
+                    text = "✅ Ты покинул основной слот."
+
+                elif user_id in raid["reserve"]:
+                    raid["reserve"].remove(user_id)
+                    changed = True
+                    text = "✅ Ты покинул резерв."
+
+                else:
+                    text = "⚠️ Ты не записан в эту стрелу."
+
+            if changed and interaction.message is not None:
+                try:
+                    await interaction.message.edit(
+                        embed=build_embed(raid),
+                        view=self,
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
+
+                except discord.HTTPException:
+                    log.exception(
+                        "Не удалось обновить панель стрелы #%s",
+                        raid["id"]
+                    )
+
+                    text += (
+                        "\n⚠️ Изменение сохранено в памяти, "
+                        "но обновить панель не удалось."
+                    )
+
+        await interaction.followup.send(
+            text,
+            ephemeral=True
+        )
+
+    @ui.button(
+        label="Взять основной слот",
+        style=discord.ButtonStyle.success,
+        emoji="🟢",
+        custom_id="main"
+    )
+    async def main_button(
+        self,
+        interaction: discord.Interaction,
+        button: ui.Button
+    ):
+        await self.change_slot(interaction, "main")
+
+    @ui.button(
+        label="Взять резерв",
+        style=discord.ButtonStyle.secondary,
+        emoji="🟡",
+        custom_id="reserve"
+    )
+    async def reserve_button(
+        self,
+        interaction: discord.Interaction,
+        button: ui.Button
+    ):
+        await self.change_slot(interaction, "reserve")
+
+    @ui.button(
+        label="Покинуть слот",
+        style=discord.ButtonStyle.danger,
+        emoji="🚪",
+        custom_id="leave"
+    )
+    async def leave_button(
+        self,
+        interaction: discord.Interaction,
+        button: ui.Button
+    ):
+        await self.change_slot(interaction, "leave")
+
+    async def on_error(self, interaction, error, item):
+        log.error(
+            "Ошибка кнопки стрелы #%s",
+            self.raid["id"],
+            exc_info=(type(error), error, error.__traceback__)
+        )
+
+        text = "❌ Не удалось обработать нажатие. Попробуй ещё раз."
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                text,
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                text,
+                ephemeral=True
+            )
+
+
+# ================= ПУБЛИКАЦИЯ =================
+
+async def publish_panel(raid, instant=False):
+    channel = await get_target_channel()
+
+    banner = discord.Embed(
+        color=discord.Color.dark_red()
+    )
+    banner.set_image(url=RAID_GIF_URL)
+
     await channel.send(
-        RAID_GIF_URL,
+        embed=banner,
         allowed_mentions=discord.AllowedMentions.none()
     )
 
+    heading = (
+        "⚡ Пик слотов открыт прямо сейчас!"
+        if instant
+        else "🏹 Открыта запись на стрелу!"
+    )
 
-async def publish_raid(number: int):
-    global last_raid_message_id
+    view = RaidView(raid)
 
-    raid = scheduled_raids.get(number)
-
-    if not raid:
-        return
-
-    seconds_to_first_message = (
-        raid["publish_time"] - datetime.now(MSK)
-    ).total_seconds()
-
-    if seconds_to_first_message > 0:
-        await asyncio.sleep(seconds_to_first_message)
-
-    raid = scheduled_raids.get(number)
-
-    if not raid:
-        return
-
-    channel = await get_target_channel()
-
-    if not channel:
-        print(
-            f"❌ Стрела #{number} не отправлена. "
-            f"Проверь CHANNEL_ID и права бота."
-        )
-
-        scheduled_raids.pop(number, None)
-        return
-
-    data = raid["data"]
-
-    minutes_left = max(
-        0,
-        int(
-            (
-                raid["start_time"] - datetime.now(MSK)
-            ).total_seconds() / 60
+    message = await channel.send(
+        content=(
+            f"@everyone {heading}\n\n"
+            "🩸 DISLOCATION MAFIA\n"
+            "Занимай слот кнопками ниже."
+        ),
+        embed=build_embed(raid),
+        view=view,
+        allowed_mentions=discord.AllowedMentions(
+            everyone=True,
+            users=False,
+            roles=False
         )
     )
 
-    if minutes_left == 0:
-        notification_text = "🏹 **Стрела начинается прямо сейчас!**"
+    raid["message"] = message
+    raid["view"] = view
 
-    elif minutes_left == 1:
-        notification_text = "🏹 **Через 1 минуту стрела!**"
 
-    elif 2 <= minutes_left <= 4:
-        notification_text = f"🏹 **Через {minutes_left} минуты стрела!**"
+async def finish_raid(raid):
+    await wait_until(raid["start"])
 
-    else:
-        notification_text = f"🏹 **Через {minutes_left} минут стрела!**"
+    view = raid["view"]
+    message = raid["message"]
 
+    if view is not None:
+        async with view.lock:
+            for child in view.children:
+                child.disabled = True
+
+            if message is not None:
+                try:
+                    await message.edit(
+                        content="🏹 Стрела началась. Запись закрыта.",
+                        embed=build_embed(raid),
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions.none()
+                    )
+
+                except discord.HTTPException:
+                    log.exception(
+                        "Не удалось закрыть панель стрелы #%s",
+                        raid["id"]
+                    )
+
+        view.stop()
+
+
+async def raid_worker(raid, instant=False):
     try:
-        await send_raid_gif(channel)
+        if not instant:
+            await wait_until(raid["publish"])
 
-        # Первое уведомление за 30 минут
-        await channel.send(
-            f"@everyone {notification_text}\n\n"
-            f"🏛️ **DISLOCATION MAFIA**\n"
-            f"🌍 Сервер: **{data['server']}**\n"
-            f"🔫 Против: **{data['faction']}**\n"
-            f"🧰 Оружие: **{data['weapon']}**\n"
-            f"🎯 Формат: **{data['format']}**\n"
-            f"⏰ Время начала: **{data['time']} МСК**\n\n"
-            f"🟢 Занимай слот ниже.",
+            if raid["cancelled"]:
+                return
 
-            allowed_mentions=discord.AllowedMentions(
-                everyone=True,
-                users=False,
-                roles=False
-            )
+            await publish_panel(raid)
+
+        # Не отправляем второе уведомление сразу после первого,
+        # если до начала уже осталось меньше 15 минут.
+        if now() < raid["final"]:
+            await wait_until(raid["final"])
+
+            if raid["cancelled"]:
+                return
+
+            try:
+                channel = await get_target_channel()
+                panel = raid["message"]
+
+                panel_link = (
+                    f"\n\n🟢 Запись в слоты: {panel.jump_url}"
+                    if panel is not None
+                    else ""
+                )
+
+                await channel.send(
+                    content=(
+                        "@everyone ⏰ Через 15 минут начинается стрела!\n\n"
+                        "🩸 DISLOCATION MAFIA\n"
+                        f"{raid_details(raid)}"
+                        f"{panel_link}"
+                    ),
+                    embed=build_embed(raid),
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=True,
+                        users=False,
+                        roles=False
+                    )
+                )
+
+            except discord.HTTPException:
+                log.exception(
+                    "Не удалось отправить напоминание "
+                    "о стреле #%s",
+                    raid["id"]
+                )
+
+        if not raid["cancelled"]:
+            await finish_raid(raid)
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception:
+        log.exception(
+            "Ошибка обработки стрелы #%s",
+            raid["id"]
         )
-
-        view = RaidView(data)
-
-        message = await channel.send(
-            embed=build_embed(data),
-            view=view
-        )
-
-        view.message = message
-
-        active_raids[message.id] = {
-            "data": data,
-            "view": view,
-            "message": message
-        }
-
-        last_raid_message_id = message.id
-
-    except discord.Forbidden:
-        print(
-            f"❌ Нет прав на первую публикацию стрелы #{number}."
-        )
-
-        scheduled_raids.pop(number, None)
-        return
-
-    except discord.HTTPException as error:
-        print(f"❌ Ошибка Discord: {error}")
-
-        scheduled_raids.pop(number, None)
-        return
-
-    # Второе уведомление и актуальный пик за 15 минут
-    seconds_to_final_message = (
-        raid["final_time"] - datetime.now(MSK)
-    ).total_seconds()
-
-    if seconds_to_final_message > 0:
-        await asyncio.sleep(seconds_to_final_message)
-
-    # Проверяем, что стрелу не отменили
-    if number not in scheduled_raids:
-        return
-
-    try:
-        await send_raid_gif(channel)
-
-        final_embed = build_embed(data)
-
-        await channel.send(
-            f"@everyone ⏰ **Через {FINAL_NOTIFICATION_BEFORE_MINUTES} минут "
-            f"начинается стрела!**\n\n"
-            f"🏛️ **DISLOCATION MAFIA**\n"
-            f"🌍 Сервер: **{data['server']}**\n"
-            f"🔫 Против: **{data['faction']}**\n"
-            f"🧰 Оружие: **{data['weapon']}**\n"
-            f"🎯 Формат: **{data['format']}**\n"
-            f"⏰ Время начала: **{data['time']} МСК**\n\n"
-            f"📋 Ниже показан актуальный пик слотов.",
-
-            embed=final_embed,
-
-            allowed_mentions=discord.AllowedMentions(
-                everyone=True,
-                users=False,
-                roles=False
-            )
-        )
-
-    except discord.Forbidden:
-        print(
-            f"❌ Нет прав на итоговое сообщение стрелы #{number}."
-        )
-
-    except discord.HTTPException as error:
-        print(f"❌ Ошибка итогового сообщения: {error}")
 
     finally:
-        scheduled_raids.pop(number, None)
+        raid_tasks.pop(raid["id"], None)
 
 
-async def random_chat_loop():
-    await bot.wait_until_ready()
+# ================= СОЗДАНИЕ СТРЕЛЫ =================
 
-    while not bot.is_closed():
-        await asyncio.sleep(
-            random.randint(
-                MIN_CHAT_DELAY_SECONDS,
-                MAX_CHAT_DELAY_SECONDS
-            )
-        )
-
-        channel = await get_target_channel()
-
-        if channel is None:
-            continue
-
-        if phrase_counts and random.choice([True, True, False]):
-            popular_phrases = [
-                phrase
-                for phrase, count in phrase_counts.most_common(30)
-            ]
-
-            text = random.choice(popular_phrases)
-
-        elif word_counts:
-            popular_words = [
-                word
-                for word, count in word_counts.most_common(30)
-            ]
-
-            text = random.choice(popular_words)
-
-        else:
-            continue
-
-        await channel.send(
-            f"💬 {text}",
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if (
-        message.guild is not None
-        and not message.author.bot
-        and message.channel.id == CHANNEL_ID
-    ):
-        text = clean_chat_text(message.content)
-
-        if text and not text.startswith(("!", "/")):
-            words = re.findall(
-                r"[a-zа-яё0-9]{3,}",
-                text,
-                flags=re.IGNORECASE
-            )
-
-            word_counts.update(words)
-
-            if 2 <= len(words) <= 10 and len(text) <= 120:
-                phrase_counts[text] += 1
-
-    await bot.process_commands(message)
-
-
-@bot.tree.command(
-    name="slot",
-    description="🏹 Запланировать новую стрелу Dislocation Mafia"
-)
-@app_commands.describe(
-    server="🌍 Выбери сервер",
-    faction="🔫 Выбери фракцию противника",
-    deagle="🧨 Разрешён ли Deagle?",
-    shotgun="🔫 Разрешён ли Shotgun?",
-    rifla="🎯 Разрешена ли Rifla?",
-    format="🎯 Выбери формат",
-    time_str="⏰ Выбери время начала стрелы по МСК"
-)
-@app_commands.choices(
-    server=SERVER_CHOICES,
-    faction=FACTION_CHOICES,
-    deagle=YES_NO_CHOICES,
-    shotgun=YES_NO_CHOICES,
-    rifla=YES_NO_CHOICES,
-    format=FORMAT_CHOICES,
-    time_str=TIME_CHOICES
-)
-async def slot(
-    interaction: Interaction,
-    server: app_commands.Choice[str],
-    faction: app_commands.Choice[str],
-    deagle: app_commands.Choice[str],
-    shotgun: app_commands.Choice[str],
-    rifla: app_commands.Choice[str],
-    format: app_commands.Choice[str],
-    time_str: app_commands.Choice[str]
+async def create_raid(
+    interaction,
+    server,
+    time_str,
+    format_choice,
+    instant
 ):
-    global next_schedule_id
+    global next_raid_id
 
-    if interaction.guild is not None:
+    if interaction.user.id not in ADMIN_IDS:
         await interaction.response.send_message(
-            "📩 Используй команду `/slot` в личных сообщениях с ботом.",
-            ephemeral=True
-        )
-        return
-
-    if not is_admin(interaction.user):
-        await interaction.response.send_message(
-            "🚫 У тебя нет прав для создания стрел.",
-            ephemeral=True
-        )
-        return
-
-    weapons = []
-
-    if deagle.value == "yes":
-        weapons.append("Deagle")
-
-    if shotgun.value == "yes":
-        weapons.append("Shotgun")
-
-    if rifla.value == "yes":
-        weapons.append("Rifla")
-
-    if not weapons:
-        await interaction.response.send_message(
-            "❌ Ошибка: нужно выбрать хотя бы одно оружие.",
-            ephemeral=True
-        )
-        return
-
-    try:
-        slots_total = parse_format(format.value)
-        start_time = get_start_datetime(time_str.value)
-
-    except ValueError as error:
-        await interaction.response.send_message(
-            f"❌ Ошибка: {error}",
-            ephemeral=True
-        )
-        return
-
-    now = datetime.now(MSK)
-
-    # Первое сообщение за 30 минут
-    publish_time = start_time - timedelta(
-        minutes=NOTIFICATION_BEFORE_MINUTES
-    )
-
-    if publish_time <= now:
-        publish_time = now
-
-    # Второе сообщение и итоговые слоты за 15 минут
-    final_time = start_time - timedelta(
-        minutes=FINAL_NOTIFICATION_BEFORE_MINUTES
-    )
-
-    if final_time <= now:
-        final_time = now
-
-    schedule_id = next_schedule_id
-    next_schedule_id += 1
-
-    data = {
-        "server": server.value,
-        "faction": faction.value,
-        "weapon": ", ".join(weapons),
-        "format": format.value,
-        "slots_total": slots_total,
-        "time": time_str.value,
-        "creator_id": interaction.user.id,
-        "main": [],
-        "reserve": []
-    }
-
-    scheduled_raids[schedule_id] = {
-        "data": data,
-        "start_time": start_time,
-        "publish_time": publish_time,
-        "final_time": final_time,
-        "task": None
-    }
-
-    task = asyncio.create_task(
-        publish_raid(schedule_id)
-    )
-
-    scheduled_raids[schedule_id]["task"] = task
-
-    await interaction.response.send_message(
-        f"✅ **Стрела #{schedule_id} запланирована.**\n\n"
-                f"🏛️ **DISLOCATION MAFIA**\n"
-        f"🌍 Сервер: **{server.value}**\n"
-        f"🔫 Против: **{faction.value}**\n"
-        f"🧰 Оружие: **{', '.join(weapons)}**\n"
-        f"🎯 Формат: **{format.value}**\n"
-        f"⏰ Начало: **{start_time:%d.%m.%Y %H:%M} МСК**\n"
-        f"📣 Уведомление и открытие слотов: "
-        f"**{publish_time:%d.%m.%Y %H:%M} МСК**\n"
-        f"📋 Итоговый пик слотов: "
-        f"**{final_time:%d.%m.%Y %H:%M} МСК**",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(
-    name="fslot",
-    description="⚡ Запустить пик слотов прямо сейчас"
-)
-@app_commands.describe(
-    server="🌍 Выбери сервер",
-    faction="🔫 Выбери фракцию противника",
-    deagle="🧨 Разрешён ли Deagle?",
-    shotgun="🔫 Разрешён ли Shotgun?",
-    rifla="🎯 Разрешена ли Rifla?",
-    format="🎯 Выбери формат",
-    time_str="⏰ Выбери время начала стрелы по МСК"
-)
-@app_commands.choices(
-    server=SERVER_CHOICES,
-    faction=FACTION_CHOICES,
-    deagle=YES_NO_CHOICES,
-    shotgun=YES_NO_CHOICES,
-    rifla=YES_NO_CHOICES,
-    format=FORMAT_CHOICES,
-    time_str=TIME_CHOICES
-)
-async def fslot(
-    interaction: Interaction,
-    server: app_commands.Choice[str],
-    faction: app_commands.Choice[str],
-    deagle: app_commands.Choice[str],
-    shotgun: app_commands.Choice[str],
-    rifla: app_commands.Choice[str],
-    format: app_commands.Choice[str],
-    time_str: app_commands.Choice[str]
-):
-    global next_schedule_id
-    global last_raid_message_id
-
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            "📩 Используй команду `/fslot` на сервере.",
-            ephemeral=True
-        )
-        return
-
-    if not is_admin(interaction.user):
-        await interaction.response.send_message(
-            "🚫 У тебя нет прав для запуска стрел.",
-            ephemeral=True
-        )
-        return
-
-    weapons = []
-
-    if deagle.value == "yes":
-        weapons.append("Deagle")
-
-    if shotgun.value == "yes":
-        weapons.append("Shotgun")
-
-    if rifla.value == "yes":
-        weapons.append("Rifla")
-
-    if not weapons:
-        await interaction.response.send_message(
-            "❌ Ошибка: нужно выбрать хотя бы одно оружие.",
-            ephemeral=True
-        )
-        return
-
-    try:
-        slots_total = parse_format(format.value)
-        start_time = get_start_datetime(time_str.value)
-
-    except ValueError as error:
-        await interaction.response.send_message(
-            f"❌ Ошибка: {error}",
+            "🚫 Только руководство может создавать стрелы.",
             ephemeral=True
         )
         return
 
     await interaction.response.defer(ephemeral=True)
 
-    channel = await get_target_channel()
+    try:
+        await get_target_channel()
 
-    if not channel:
+    except Exception:
+        log.exception("Не удалось получить канал стрел.")
+
         await interaction.followup.send(
-            "❌ Не найден канал для публикации стрелы. "
-            "Проверь `CHANNEL_ID` и права бота.",
+            "❌ Не удалось получить канал стрел. "
+            "Проверь CHANNEL_ID и доступ бота к каналу.",
             ephemeral=True
         )
         return
 
-    schedule_id = next_schedule_id
-    next_schedule_id += 1
+    current = now()
+    start = get_start_time(time_str.value)
 
-    data = {
+    raid_id = next_raid_id
+    next_raid_id += 1
+
+    raid = {
+        "id": raid_id,
         "server": server.value,
-        "faction": faction.value,
-        "weapon": ", ".join(weapons),
-        "format": format.value,
-        "slots_total": slots_total,
-        "time": time_str.value,
-        "creator_id": interaction.user.id,
+        "slots": format_choice.value,
+        "start": start,
+        "publish": max(
+            current,
+            start - timedelta(
+                minutes=FIRST_NOTIFICATION_MINUTES
+            )
+        ),
+        "final": start - timedelta(
+            minutes=FINAL_NOTIFICATION_MINUTES
+        ),
         "main": [],
-        "reserve": []
+        "reserve": [],
+        "message": None,
+        "view": None,
+        "cancelled": False,
     }
 
-    try:
-        await send_raid_gif(channel)
+    raids[raid_id] = raid
 
-        await channel.send(
-            "@everyone ⚡ **Пик слотов запущен прямо сейчас!**\n\n"
-            f"🏛️ **DISLOCATION MAFIA**\n"
-            f"🌍 Сервер: **{data['server']}**\n"
-            f"🔫 Против: **{data['faction']}**\n"
-            f"🧰 Оружие: **{data['weapon']}**\n"
-            f"🎯 Формат: **{data['format']}**\n"
-            f"⏰ Время начала: **{data['time']} МСК**\n\n"
-            "🟢 Занимай слот ниже.",
-            allowed_mentions=discord.AllowedMentions(
-                everyone=True,
-                users=False,
-                roles=False
+    if instant:
+        try:
+            await publish_panel(raid, instant=True)
+
+        except Exception:
+            log.exception(
+                "Ошибка мгновенной публикации стрелы #%s",
+                raid_id
             )
+
+            raids.pop(raid_id, None)
+
+            await interaction.followup.send(
+                "❌ Не удалось опубликовать слоты. "
+                "Проверь права бота на отправку сообщений "
+                "и встраивание ссылок.",
+                ephemeral=True
+            )
+            return
+
+    raid_tasks[raid_id] = asyncio.create_task(
+        raid_worker(raid, instant=instant)
+    )
+
+    heading = (
+        f"⚡ Пик слотов #{raid_id} открыт!"
+        if instant
+        else f"✅ Стрела #{raid_id} запланирована!"
+    )
+
+    text = (
+        f"{heading}\n\n"
+        f"{raid_details(raid)}"
+    )
+
+    if not instant:
+        text += (
+            "\n📣 Открытие записи: "
+            f"{raid['publish']:%d.%m %H:%M}"
         )
 
-        view = RaidView(data)
-
-        message = await channel.send(
-            embed=build_embed(data),
-            view=view
+    if start.date() > current.date():
+        text += (
+            "\n\n📅 Выбранное время уже прошло сегодня. "
+            "Начало назначено на завтра."
         )
 
-        view.message = message
+    await interaction.followup.send(
+        text,
+        ephemeral=True
+    )
 
-        active_raids[message.id] = {
-            "data": data,
-            "view": view,
-            "message": message
-        }
 
-        last_raid_message_id = message.id
+# ================= /slot =================
 
-        await interaction.followup.send(
-            f"✅ **Стрела #{schedule_id} запущена прямо сейчас.**\n\n"
-            f"🌍 Сервер: **{data['server']}**\n"
-            f"🔫 Против: **{data['faction']}**\n"
-            f"🧰 Оружие: **{data['weapon']}**\n"
-            f"🎯 Формат: **{data['format']}**\n"
-            f"⏰ Начало: **{start_time:%d.%m.%Y %H:%M} МСК**",
-            ephemeral=True
-        )
+@bot.tree.command(
+    name="slot",
+    description="🏹 Запланировать стрелу Dislocation Mafia"
+)
+@app_commands.describe(
+    server="Выбери сервер",
+    time_str="Выбери время начала",
+    format="Выбери формат: 2x2, 3x3, 4x4 или 5x5"
+)
+@app_commands.choices(
+    server=SERVER_CHOICES,
+    time_str=TIME_CHOICES,
+    format=FORMAT_CHOICES
+)
+async def slot(
+    interaction: discord.Interaction,
+    server: app_commands.Choice[str],
+    time_str: app_commands.Choice[str],
+    format: app_commands.Choice[int]
+):
+    await create_raid(
+        interaction,
+        server,
+        time_str,
+        format,
+        instant=False
+    )
 
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "❌ У бота нет прав отправлять сообщения в канал стрел.",
-            ephemeral=True
-        )
 
-    except discord.HTTPException as error:
-        await interaction.followup.send(
-            f"❌ Ошибка Discord при запуске стрелы: `{error}`",
-            ephemeral=True
-        )
+# ================= /fslot =================
 
+@bot.tree.command(
+    name="fslot",
+    description="⚡ Открыть пик слотов прямо сейчас"
+)
+@app_commands.describe(
+    server="Выбери сервер",
+    time_str="Выбери время начала",
+    format="Выбери формат: 2x2, 3x3, 4x4 или 5x5"
+)
+@app_commands.choices(
+    server=SERVER_CHOICES,
+    time_str=TIME_CHOICES,
+    format=FORMAT_CHOICES
+)
+async def fslot(
+    interaction: discord.Interaction,
+    server: app_commands.Choice[str],
+    time_str: app_commands.Choice[str],
+    format: app_commands.Choice[int]
+):
+    await create_raid(
+        interaction,
+        server,
+        time_str,
+        format,
+        instant=True
+    )
+
+
+# ================= /strels =================
 
 @bot.tree.command(
     name="strels",
-    description="📋 Показать все запланированные стрелы"
+    description="📋 Показать предстоящие стрелы"
 )
-async def strels(interaction: Interaction):
-    if interaction.guild is None:
+async def strels(interaction: discord.Interaction):
+    current = now()
+
+    upcoming = [
+        raid
+        for raid in raids.values()
+        if not raid["cancelled"]
+        and raid["start"] > current
+    ]
+
+    if not upcoming:
         await interaction.response.send_message(
-            "🚫 Команду `/strels` нельзя использовать в личных сообщениях.",
+            "📭 Предстоящих стрел пока нет.",
             ephemeral=True
         )
         return
 
-    if not scheduled_raids:
-        await interaction.response.send_message(
-            "📭 Сейчас нет запланированных стрел.",
-            ephemeral=True
-        )
-        return
+    upcoming.sort(
+        key=lambda raid: raid["start"]
+    )
 
     embed = discord.Embed(
-        title="📋 Запланированные стрелы",
-        description="🩸 **DISLOCATION MAFIA**",
+        title="🩸 DISLOCATION MAFIA",
+        description="📋 Предстоящие стрелы",
         color=discord.Color.dark_red()
     )
 
-    for number, raid in scheduled_raids.items():
-        data = raid["data"]
-
+    for raid in upcoming[:25]:
         embed.add_field(
-            name=f"🏹 Стрела #{number} | {data['server']}",
-            value=(
-                f"🔫 Против: **{data['faction']}**\n"
-                f"🧰 Оружие: **{data['weapon']}**\n"
-                f"🎯 Формат: **{data['format']}**\n"
-                f"⏰ Начало: **{raid['start_time']:%d.%m.%Y %H:%M} МСК**\n"
-                f"👑 Создал: <@{data['creator_id']}>"
-            ),
+            name=f"🏹 Стрела #{raid['id']}",
+            value=raid_details(raid),
             inline=False
+        )
+
+    if len(upcoming) > 25:
+        embed.set_footer(
+            text="Показаны ближайшие 25 стрел."
         )
 
     await interaction.response.send_message(
@@ -997,81 +783,45 @@ async def strels(interaction: Interaction):
     )
 
 
+# ================= /cancel =================
+
 @bot.tree.command(
     name="cancel",
-    description="❌ Отменить запланированную стрелу"
+    description="🚫 Отменить стрелу"
 )
 @app_commands.describe(
-    raid_id="Номер стрелы, которую нужно отменить"
+    raid_id="Номер стрелы"
 )
 async def cancel(
-    interaction: Interaction,
+    interaction: discord.Interaction,
     raid_id: int
 ):
-    if interaction.guild is not None:
+    if interaction.user.id not in ADMIN_IDS:
         await interaction.response.send_message(
-            "📩 Используй команду `/cancel` в личных сообщениях с ботом.",
+            "🚫 Только руководство может отменять стрелы.",
             ephemeral=True
         )
         return
 
-    if not is_admin(interaction.user):
+    raid = raids.get(raid_id)
+
+    if raid is None or raid["cancelled"]:
         await interaction.response.send_message(
-            "🚫 У тебя нет прав для отмены стрел.",
+            "❌ Стрела не найдена или уже отменена.",
             ephemeral=True
         )
         return
 
-    raid = scheduled_raids.get(raid_id)
+    await interaction.response.defer(ephemeral=True)
 
-    if not raid:
-        await interaction.response.send_message(
-            f"❌ Стрела #{raid_id} не найдена.",
-            ephemeral=True
-        )
-        return
+    raid["cancelled"] = True
 
-    task = raid.get("task")
+    task = raid_tasks.pop(raid_id, None)
 
-    if task and not task.done():
+    if task is not None:
         task.cancel()
 
-    scheduled_raids.pop(raid_id, None)
+    text = f"✅ Стрела #{raid_id} отменена."
 
-    await interaction.response.send_message(
-        f"✅ Стрела #{raid_id} отменена.",
-        ephemeral=True
-    )
-
-
-@bot.event
-async def setup_hook():
-    await bot.tree.sync()
-    print("✅ Слэш-команды синхронизированы.")
-
-
-@bot.event
-async def on_ready():
-    print(f"✅ Бот запущен как {bot.user} (ID: {bot.user.id})")
-    print(
-        f"🕒 Текущее московское время: "
-        f"{datetime.now(MSK):%d.%m.%Y %H:%M:%S}"
-    )
-
-    bot.loop.create_task(random_chat_loop())
-
-
-try:
-    bot.run(TOKEN, log_handler=None)
-
-except discord.LoginFailure:
-    raise RuntimeError(
-        "❌ Неверный Discord-токен. Сбрось токен в Developer Portal "
-        "и обнови переменную окружения DISCORD_TOKEN."
-    )
-
-except discord.PrivilegedIntentsRequired:
-    raise RuntimeError(
-        "❌ Включи Message Content Intent в Discord Developer Portal "
-        "-> Bot -> Privileged Gateway Intents."
-)
+    view = raid["view"]
+    message = raid

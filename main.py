@@ -782,7 +782,6 @@ async def strels(interaction: discord.Interaction):
         ephemeral=True
     )
 
-
 # ================= /cancel =================
 
 @bot.tree.command(
@@ -823,7 +822,8 @@ async def cancel(
 
     text = f"✅ Стрела #{raid_id} отменена."
 
-        message = raid["message"]
+    view = raid["view"]
+    message = raid["message"]
 
     if view is not None:
         async with view.lock:
